@@ -1,4 +1,5 @@
 // server.js (exports app & models for tests; httpOnly cookie auth, pagination, read receipts, socket auth)
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -14,15 +15,41 @@ const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const isProd = NODE_ENV === 'production';
 
-mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(()=> console.log('Mongo connected'))
-  .catch(err => console.error('Mongo error', err));
+// Connect to MongoDB with retry logic
+const connectDB = async () => {
+  let retries = 5;
+  while (retries) {
+    try {
+      await mongoose.connect(MONGO_URI, { 
+        useNewUrlParser: true, 
+        useUnifiedTopology: true,
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS: 45000,
+      });
+      console.log('✅ MongoDB connected successfully');
+      break;
+    } catch (err) {
+      retries -= 1;
+      console.log(`⚠️ MongoDB connection error (${retries} retries left):`, err.message);
+      if (retries === 0) {
+        console.error('❌ Failed to connect to MongoDB after 5 attempts');
+        console.log('📝 Make sure MongoDB is running: mongod');
+        process.exit(1);
+      }
+      await new Promise(res => setTimeout(res, 2000));
+    }
+  }
+};
+
+connectDB();
 
 /* ---------- Schemas ---------- */
 const userSchema = new mongoose.Schema({
-  username: { type: String, unique: true },
-  passwordHash: String,
+  username: { type: String, unique: true, required: true },
+  passwordHash: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
 });
+
 const User = mongoose.model('User', userSchema);
 
 const messageSchema = new mongoose.Schema({
@@ -38,14 +65,18 @@ const Message = mongoose.model('Message', messageSchema);
 /* ---------- App & Socket ---------- */
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
 // in-memory presence map: userId -> socket.id
 const onlineUsers = new Map();
 
 /* ---------- Helpers ---------- */
 function parseCookies(reqOrHandshake) {
-  // Accept either Express req (req.headers.cookie) or Socket handshake (handshake.headers.cookie)
   const cookieHeader = (reqOrHandshake.headers && reqOrHandshake.headers.cookie) || '';
   const cookies = {};
   if (!cookieHeader) return cookies;
@@ -102,9 +133,10 @@ app.post('/api/register', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = new User({ username, passwordHash });
     await user.save();
+    console.log(`✅ User registered: ${username}`);
     res.json({ ok: true });
   } catch (err) {
-    if (err.code === 11000) return res.status(400).json({ error: 'username taken' });
+    if (err.code === 11000) return res.status(400).json({ error: 'username already taken' });
     console.error(err);
     res.status(500).json({ error: 'server error' });
   }
@@ -113,18 +145,25 @@ app.post('/api/register', async (req, res) => {
 // Login -> sets httpOnly cookie + returns user info (client cannot read cookie)
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  const user = await User.findOne({ username });
-  if (!user) return res.status(400).json({ error: 'invalid credentials' });
-  const match = await bcrypt.compare(password, user.passwordHash);
-  if (!match) return res.status(400).json({ error: 'invalid credentials' });
-  const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
-  res.cookie('token', token, cookieOptions);
-  res.json({ userId: user._id, username: user.username });
+  try {
+    const user = await User.findOne({ username });
+    if (!user) return res.status(400).json({ error: 'invalid credentials' });
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) return res.status(400).json({ error: 'invalid credentials' });
+    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+    res.cookie('token', token, cookieOptions);
+    console.log(`✅ User logged in: ${username}`);
+    res.json({ userId: user._id, username: user.username });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server error' });
+  }
 });
 
 // Logout - clears cookie
 app.post('/api/logout', (req, res) => {
   res.clearCookie('token', { ...cookieOptions, maxAge: 0 });
+  console.log('✅ User logged out');
   res.json({ ok: true });
 });
 
@@ -143,17 +182,17 @@ app.get('/api/me', (req, res) => {
 
 /* ---------- Users ---------- */
 app.get('/api/users', authMiddleware, async (req, res) => {
-  const users = await User.find({}, '_id username').lean();
-  const others = users.filter(u => String(u._id) !== String(req.user.userId));
-  res.json({ users: others });
+  try {
+    const users = await User.find({}, '_id username').lean();
+    const others = users.filter(u => String(u._id) !== String(req.user.userId));
+    res.json({ users: others });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server error' });
+  }
 });
 
 /* ---------- Messages: history (pagination) ---------- */
-/*
-  GET /api/messages?withUserId=<id>&limit=50&before=<messageId>
-  - if before provided, loads messages before that message (older)
-  - returns messages ordered oldest -> newest
-*/
 app.get('/api/messages', authMiddleware, async (req, res) => {
   const withUserId = req.query.withUserId;
   const limit = Math.min(parseInt(req.query.limit || '50', 10), 1000);
@@ -178,16 +217,13 @@ app.get('/api/messages', authMiddleware, async (req, res) => {
       }
     }
 
-    // fetch newest-first limited, then reverse to return oldest->newest page
     const docs = await Message.find(query)
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
 
     const messages = docs.reverse();
-    const hasMore = docs.length === limit; // if we filled the page, there may be more
-    // include populated 'from' username for client convenience
-    // Note: messages currently have 'from' ObjectId; client maps username from returned doc if available
+    const hasMore = docs.length === limit;
     res.json({ messages, hasMore });
   } catch (err) {
     console.error(err);
@@ -196,11 +232,6 @@ app.get('/api/messages', authMiddleware, async (req, res) => {
 });
 
 /* ---------- Mark messages read (read receipts) ---------- */
-/*
-  POST /api/mark-read?withUserId=<id>
-  - marks all messages sent FROM withUserId TO current user as read.
-  - notifies sender(s) via socket event 'messages-read'
-*/
 app.post('/api/mark-read', authMiddleware, async (req, res) => {
   const withUserId = req.query.withUserId || (req.body && req.body.withUserId);
   if (!withUserId) return res.status(400).json({ error: 'withUserId required' });
@@ -212,7 +243,6 @@ app.post('/api/mark-read', authMiddleware, async (req, res) => {
     const ids = unread.map(m => m._id);
     if (ids.length > 0) {
       await Message.updateMany({ _id: { $in: ids } }, { $set: { read: true } });
-      // notify sender if online
       const toSocketId = onlineUsers.get(String(withUserId));
       if (toSocketId) {
         io.to(toSocketId).emit('messages-read', { fromUserId: String(req.user.userId), ids: ids.map(String) });
@@ -241,14 +271,14 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   const { userId, username } = socket.user;
-  console.log('connected', username, userId, socket.id);
+  console.log(`🟢 Connected: ${username} (${socket.id})`);
   onlineUsers.set(String(userId), socket.id);
 
-  // presence (optional)
+  // presence
   socket.emit('online-users', Array.from(onlineUsers.keys()));
+  socket.broadcast.emit('user-online', { userId: String(userId), username });
 
   socket.on('private-message', async (data) => {
-    // data: { toUserId, text }
     const { toUserId, text } = data || {};
     if (!toUserId || !text) return;
     try {
@@ -263,10 +293,8 @@ io.on('connection', (socket) => {
         createdAt: msgDoc.createdAt,
         read: msgDoc.read
       };
-      // deliver to recipient
       const toSocketId = onlineUsers.get(String(toUserId));
       if (toSocketId) io.to(toSocketId).emit('private-message', payload);
-      // echo to sender
       socket.emit('private-message', payload);
     } catch (err) {
       console.error('failed to save message', err);
@@ -274,9 +302,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // client may request marking messages as read over socket too
   socket.on('mark-read', async (data) => {
-    // data: { withUserId }
     try {
       const withUserId = data && data.withUserId;
       if (!withUserId) return;
@@ -300,13 +326,24 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     onlineUsers.delete(String(userId));
-    console.log('disconnected', username);
+    console.log(`🔴 Disconnected: ${username}`);
+    socket.broadcast.emit('user-offline', { userId: String(userId), username });
   });
 });
 
-/* ---------- Start server (only when run directly) ---------- */
+/* ---------- Start server ---------- */
 if (require.main === module) {
-  server.listen(PORT, ()=> console.log('Server listening on', PORT));
+  server.listen(PORT, () => {
+    console.log(`
+╔════════════════════════════════════════╗
+║   Simple Chat Server Running 🚀        ║
+╠════════════════════════════════════════╣
+║   URL: http://localhost:${PORT}           ║
+║   Environment: ${NODE_ENV}              ║
+║   MongoDB: ${MONGO_URI}                   ║
+╚════════════════════════════════════════╝
+    `);
+  });
 }
 
 // Export for tests and for programmatic use
