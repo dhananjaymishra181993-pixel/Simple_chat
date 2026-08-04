@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Users</title></head>
+<body>
+  <h2>Users</h2>
+  <div>Logged in as: <span id="me"></span> <button id="logout">Logout</button></div>
+  <ul id="list"></ul>
+
+  <script>
+    async function ensureMe() {
+      try {
+        const res = await fetch('/api/me', { credentials: 'include' });
+        if (!res.ok) return location = '/login.html';
+        const me = await res.json();
+        localStorage.setItem('userId', me.userId);
+        localStorage.setItem('username', me.username);
+        document.getElementById('me').innerText = me.username || 'me';
+      } catch (err) {
+        location = '/login.html';
+      }
+    }
+
+    ensureMe();
+
+    document.getElementById('logout').onclick = async () => {
+      await fetch('/api/logout', { method: 'POST', credentials: 'include' });
+      localStorage.clear();
+      location = '/login.html';
+    };
+
+    async function loadUsers() {
+      const res = await fetch('/api/users', { credentials: 'include' });
+      if (!res.ok) { location = '/login.html'; return; }
+      const data = await res.json();
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      data.users.forEach(u => {
+        const li = document.createElement('li');
+        li.textContent = u.username + ' ';
+        const btn = document.createElement('button');
+        btn.textContent = 'Chat';
+        btn.onclick = () => {
+          const url = `/chat.html?toUserId=${u._id}&toUsername=${encodeURIComponent(u.username)}`;
+          window.location = url;
+        };
+        li.appendChild(btn);
+        list.appendChild(li);
+      });
+    }
+    setTimeout(loadUsers, 250); // slight delay to allow /api/me to complete
+  </script>
+</body>
+</html>

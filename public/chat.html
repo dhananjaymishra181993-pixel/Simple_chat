@@ -1,0 +1,185 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Chat</title></head>
+<body>
+  <h3 id="title">Chat</h3>
+  <div id="messages" style="border:1px solid #ccc; height:400px; overflow:auto; padding:10px;"></div>
+  <form id="form">
+    <input id="text" autocomplete="off" placeholder="Type a message" style="width:70%" />
+    <button>Send</button>
+  </form>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const toUserId = params.get('toUserId');
+    const toUsername = params.get('toUsername');
+    let myUserId = localStorage.getItem('userId');
+    let myUsername = localStorage.getItem('username');
+
+    if (!toUserId) location = '/users.html';
+
+    document.getElementById('title').innerText = `Chat with ${toUsername}`;
+    const messagesDiv = document.getElementById('messages');
+
+    // History pagination state
+    let earliestMessageId = null;
+    let hasMore = false;
+    const PAGE_LIMIT = 50;
+    let loadingOlder = false;
+
+    // Map messageId -> dom element, for quick read-receipt updates
+    const messageEls = new Map();
+
+    function createMessageElement(msg) {
+      const p = document.createElement('div');
+      p.dataset.id = msg._id || '';
+      const fromId = (msg.from && msg.from.userId) ? msg.from.userId : (msg.from && msg.from.toString) ? msg.from.toString() : msg.from;
+      const isMine = String(fromId) === String(myUserId);
+      p.className = isMine ? 'msg mine' : 'msg theirs';
+      const t = msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString() : '';
+      const readTick = (isMine && msg.read) ? ' ✓' : '';
+      p.textContent = `${t} ${isMine ? 'Me' : (msg.from && msg.from.username) ? msg.from.username : toUsername}: ${msg.text}${readTick}`;
+      return p;
+    }
+
+    // fetch /api/me if we don't have user info
+    async function ensureMe() {
+      try {
+        const res = await fetch('/api/me', { credentials: 'include' });
+        if (!res.ok) return location = '/login.html';
+        const me = await res.json();
+        myUserId = me.userId;
+        myUsername = me.username;
+        localStorage.setItem('userId', myUserId);
+        localStorage.setItem('username', myUsername);
+      } catch (err) {
+        location = '/login.html';
+      }
+    }
+
+    // Load the most recent page (initial=true) or older messages (initial=false)
+    async function loadHistory(initial = false) {
+      if (loadingOlder) return;
+      loadingOlder = true;
+      const q = new URLSearchParams({ withUserId: toUserId, limit: PAGE_LIMIT });
+      if (earliestMessageId && !initial) q.set('before', earliestMessageId);
+      try {
+        const res = await fetch('/api/messages?' + q.toString(), { credentials: 'include' });
+        if (!res.ok) { if (res.status === 401) location = '/login.html'; loadingOlder = false; return; }
+        const data = await res.json();
+        // data.messages is oldest->newest
+        if (data.messages && data.messages.length) {
+          if (initial) {
+            messagesDiv.innerHTML = '';
+            data.messages.forEach(m => {
+              const el = createMessageElement(m);
+              messagesDiv.appendChild(el);
+              messageEls.set(String(m._1d), el);
+            });
+            // scroll to bottom on initial load
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+          } else {
+            // when loading older, preserve scroll position
+            const oldScrollHeight = messagesDiv.scrollHeight;
+            data.messages.forEach(m => {
+              const el = createMessageElement(m);
+              messagesDiv.insertBefore(el, messagesDiv.firstChild);
+              messageEls.set(String(m._id), el);
+            });
+            // adjust scroll so user stays at same message
+            const newScrollHeight = messagesDiv.scrollHeight;
+            messagesDiv.scrollTop = newScrollHeight - oldScrollHeight + messagesDiv.scrollTop;
+          }
+          earliestMessageId = data.messages[0]._id;
+        }
+        hasMore = !!data.hasMore;
+      } catch (err) {
+        console.error('failed to load history', err);
+      } finally {
+        loadingOlder = false;
+      }
+    }
+
+    // mark-read after loading chat
+    async function markRead() {
+      try {
+        const res = await fetch('/api/mark-read?withUserId=' + encodeURIComponent(toUserId), {
+          method: 'POST',
+          credentials: 'include'
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        // local UI update handled by incoming 'messages-read' event for the sender,
+        // but if we're the one marking read we also can update local elements (messages that we sent earlier)
+        console.log('marked read', data);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    (async () => {
+      await ensureMe();
+      await loadHistory(true);
+      // mark as read any messages sent to me by the other user
+      markRead();
+    })();
+
+    // infinite scroll: when user scrolls near top, load older messages if available
+    messagesDiv.addEventListener('scroll', () => {
+      if (messagesDiv.scrollTop < 50 && hasMore && !loadingOlder) {
+        loadHistory(false);
+      }
+    });
+
+    // socket.io: rely on cookie-based auth, do not send token manually
+    const socket = io();
+
+    socket.on('connect_error', (err) => {
+      const p = document.createElement('div');
+      p.textContent = 'Connection error: ' + err.message;
+      messagesDiv.appendChild(p);
+    });
+
+    socket.on('private-message', (msg) => {
+      // msg: { _id, from: {userId, username}, toUserId, text, createdAt, read }
+      const el = createMessageElement(msg);
+      messagesDiv.appendChild(el);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      messageEls.set(String(msg._id), el);
+      // if this message is to me (i.e., msg.toUserId === myUserId) then mark read immediately
+      if (String(msg.toUserId) === String(myUserId)) {
+        // notify server we read it (both HTTP and socket available)
+        socket.emit('mark-read', { withUserId: msg.from.userId });
+      }
+    });
+
+    socket.on('messages-read', (info) => {
+      // info: { fromUserId, ids }
+      // These ids are messages that the other user has marked read (i.e., messages we sent)
+      if (info && Array.isArray(info.ids)) {
+        info.ids.forEach(id => {
+          const el = messageEls.get(String(id));
+          if (el) {
+            // append tick if not present
+            if (!el.textContent.includes('✓')) el.textContent = el.textContent + ' ✓';
+          }
+        });
+      }
+    });
+
+    document.getElementById('form').onsubmit = (e) => {
+      e.preventDefault();
+      const t = document.getElementById('text');
+      const text = t.value.trim();
+      if (!text) return;
+      socket.emit('private-message', { toUserId, text });
+      t.value = '';
+    };
+  </script>
+  <style>
+    .msg.mine { text-align: right; color: #0a0; }
+    .msg.theirs { text-align: left; color: #000; }
+  </style>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Register</title></head>
+<body>
+  <h2>Register</h2>
+  <form id="form">
+    <input placeholder="username" id="username" required /><br/>
+    <input placeholder="password" id="password" type="password" required /><br/>
+    <button>Register</button>
+  </form>
+  <div id="msg"></div>
+  <script>
+    document.getElementById('form').onsubmit = async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      const res = await fetch('/api/register', {
+        method: 'POST',
+        headers: {'content-type':'application/json'},
+        credentials: 'include',
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById('msg').innerText = 'Registered — go to login';
+      } else {
+        document.getElementById('msg').innerText = data.error || 'Error';
+      }
+    };
+  </script>
+</body>
+</html>
