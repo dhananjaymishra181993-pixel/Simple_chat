@@ -1,14 +1,14 @@
 {
   "name": "chat",
   "version": "1.0.0",
-  "description": "Simple real-time chat application",
+  "description": "Simple real-time chat application with MySQL",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
-  "keywords": ["chat", "socket.io", "express"],
+  "keywords": ["chat", "socket.io", "express", "mysql"],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
@@ -17,9 +17,10 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.0",
-    "mongoose": "^7.3.1",
     "socket.io": "^4.8.1",
-    "dotenv": "^16.0.3"
+    "dotenv": "^16.0.3",
+    "mysql2": "^3.6.0",
+    "sequelize": "^6.33.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
